@@ -1,3 +1,5 @@
+import dgl.data
+import dgl.udf
 import torch
 import torch.nn.functional as F
 import dgl.function as fn
@@ -10,6 +12,7 @@ from scipy.special import comb
 import math
 import copy
 import numpy as np
+from typing import Literal
 
 
 class PolyConv(nn.Module):
@@ -321,7 +324,7 @@ class ChebNet(nn.Module):
 
 
 class GraphSAGE(nn.Module):
-    def __init__(self, in_feats, h_feats=32, num_classes=2, num_layers=2, agg='pool', dropout_rate=0,
+    def __init__(self, in_feats, h_feats=32, num_classes=2, num_layers=2, agg='mean', dropout_rate=0,
                  activation='ReLU', **kwargs):
         super(GraphSAGE, self).__init__()
         self.layers = nn.ModuleList()
@@ -339,6 +342,34 @@ class GraphSAGE(nn.Module):
             h = layer(graph, h)
         h = self.output_linear(h)
         return h
+
+
+class GraphSAGEMean(GraphSAGE):
+    def __init__(self, *args, **kwargs):
+        if "agg" in kwargs:
+            del kwargs['agg']
+        super().__init__(*args, agg="mean", **kwargs)
+        
+        
+class GraphSAGEPool(GraphSAGE):
+    def __init__(self, *args, **kwargs):
+        if "agg" in kwargs:
+            del kwargs['agg']
+        super().__init__(*args, agg="pool", **kwargs)
+
+
+class GraphSAGELSTM(GraphSAGE):
+    def __init__(self, *args, **kwargs):
+        if "agg" in kwargs:
+            del kwargs['agg']
+        super().__init__(*args, agg="lstm", **kwargs)
+
+
+class GraphSAGEGCN(GraphSAGE):
+    def __init__(self, *args, **kwargs):
+        if "agg" in kwargs:
+            del kwargs['agg']
+        super().__init__(*args, agg="gcn", **kwargs)
 
 
 class MLP(nn.Module):
@@ -892,3 +923,679 @@ class H2FD(nn.Module):
         model_loss = F.cross_entropy(h[train_mask][index], train_label[index])
         loss = model_loss + self.gamma1*edge_loss + self.gamma2*prototype_loss
         return loss, h
+
+
+class MySAGEModule(nn.Module):
+    def __init__(self, in_feat, out_feat, agg='mean', act='ReLU'):
+        super().__init__()
+        
+        self.in_feat = in_feat
+        self.out_feat = out_feat
+        self.linear = nn.Linear(in_feat, out_feat, bias=False)
+        if agg != 'gcn':
+            self.res_linear = nn.Linear(in_feat, out_feat, bias=True)
+        self.act = getattr(nn, act)()
+        self.agg = agg
+        
+        if agg == 'pool':
+            self.pool = nn.AdaptiveMaxPool1d(1)
+            self.pool_linear = nn.Linear(in_feat, in_feat)
+        
+        if agg == 'lstm':
+            self.lstm = nn.LSTM(in_feat, in_feat, batch_first=True)
+        
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        gain = nn.init.calculate_gain("relu")
+        if self.agg == 'pool':
+            nn.init.xavier_uniform_(self.pool_linear.weight, gain=gain)
+        if self.agg == 'lstm':
+            self.lstm.reset_parameters()
+        if self.agg != 'gcn':
+            nn.init.xavier_uniform_(self.res_linear.weight, gain=gain)
+        nn.init.xavier_uniform_(self.linear.weight, gain=gain)
+    
+    def forward(self, graph: dgl.DGLGraph, h: torch.Tensor):
+        def sage_lstm_agg_reducer(nodes: dgl.udf.NodeBatch):
+            f: torch.Tensor = nodes.mailbox['src']
+            B, _, _ = f.shape
+            h_s, c_s = (  # hidden_state, cell_state
+                # Tensor.new_zeros功能同torch.zeros, 但拷贝被调用Tensor的dtype与device
+                f.new_zeros((1, B, self.in_feat)),  # (L, B, H)
+                f.new_zeros((1, B, self.in_feat)),
+            )
+            _, (h_s, _) = self.lstm(f, (h_s, c_s))  # 输出output, (hidden_state, cell_state)
+            # output: (B, L, H)
+            # hidden_state&cell_state: (L, B, H)
+            return {'f': h_s.squeeze(0)}  # 合并Layer维度
+            
+        with graph.local_scope():
+            h_res = h
+            if self.agg == 'mean':
+                graph.ndata['f_last'] = h
+            
+                graph.update_all(
+                    fn.copy_u('f_last', 'src'),  # 将边源节点的特征发送到目标节点mailbox的src中
+                    fn.mean('src', 'f')  # 对目标节点收到的src特征及当前节点特征进行平均，写入目标节点f中
+                )
+                h = graph.ndata['f']
+                h = self.act(self.linear(h))
+            elif self.agg == 'pool':
+                graph.ndata['f_last'] = F.relu(self.pool_linear(h))
+            
+                graph.update_all(
+                    fn.copy_u('f_last', 'src'),
+                    fn.max("src", "f")
+                )
+                h = graph.ndata['f']
+                h = self.act(self.linear(h))
+            elif self.agg == 'lstm':
+                graph.ndata['f_last'] = h
+                
+                graph.update_all(
+                    fn.copy_u('f_last', 'src'),
+                    sage_lstm_agg_reducer
+                )
+                h = graph.ndata['f']
+                h = self.act(self.linear(h))
+            elif self.agg == 'gcn':
+                graph.ndata['f_last'] = h
+                
+                graph.update_all(fn.copy_u('f_last', 'src'), fn.sum('src', 'f'))
+                degs = graph.in_degrees().to(h)
+                h = (graph.dstdata['f'] + graph.dstdata['f_last']) / (
+                    degs.unsqueeze(-1) + 1
+                )  # 特征平均
+                
+                h = self.act(self.linear(h))
+            else:
+                raise NotImplementedError
+            
+            if self.agg != 'gcn':
+                h = self.res_linear(h_res) + h  # 残差
+            
+            return h
+
+
+class MySAGE(nn.Module):
+    def __init__(self, in_feats, h_feats=32, num_classes=2, 
+                 num_layers=2,  # K
+                 agg='mean',  # 聚合函数
+                 act='ReLU',  # 激活函数
+                 dropout=0.0,
+                 **kwargs
+                 ):
+        super().__init__()
+        
+        self.dropout = nn.Dropout(dropout) if dropout != 0 else nn.Identity()
+        self.layers = nn.ModuleList()
+        self.out = nn.Linear(h_feats, num_classes)
+        self.act = getattr(nn, act)()
+        
+        last_i = in_feats
+        for _ in range(num_layers):
+            self.layers.append(MySAGEModule(last_i, h_feats, agg, act))
+            # self.layers.append(dglnn.SAGEConv(last_i, h_feats, agg, activation=act))
+            last_i = h_feats
+        
+    def forward(self, graph):
+        h = graph.ndata['feature']
+        for l in self.layers:
+            # print("[DEBUG]", h.shape)
+            h = self.dropout(h)
+            h = l(graph, h)
+        h = self.out(h)
+        return h
+
+
+class MySAGEMean(MySAGE):
+    def __init__(self, *args, **kwargs):
+        if "agg" in kwargs:
+            del kwargs['agg']
+        super().__init__(*args, agg="mean", **kwargs)
+
+
+class MySAGEPool(MySAGE):
+    def __init__(self, *args, **kwargs):
+        if "agg" in kwargs:
+            del kwargs['agg']
+        super().__init__(*args, agg="pool", **kwargs)
+
+
+class MySAGELSTM(MySAGE):
+    def __init__(self, *args, **kwargs):
+        if "agg" in kwargs:
+            del kwargs['agg']
+        super().__init__(*args, agg="lstm", **kwargs)
+
+
+class MySAGEGCN(MySAGE):
+    def __init__(self, *args, **kwargs):
+        if "agg" in kwargs:
+            del kwargs['agg']
+        super().__init__(*args, agg="gcn", **kwargs)
+
+
+class GAGAEmbedding(nn.Embedding):
+    def __init__(self, max_len, emb_dim=32):
+        super().__init__(max_len, emb_dim)
+
+
+class GAGA(nn.Module):  # Label Information Enhanced Fraud Detection against Low Homophily in Graphs
+    def __init__(
+            self,
+            in_feats,
+            num_classes=2,
+            h_feats=32,  # mlp hid feats
+            num_heads=4,
+            transformer_dropout=0.1,
+            mlp_dropout=0.0,
+            agg : Literal['mean', 'cat'] = 'cat',
+            num_edge_types=1,
+            n_layers=3,
+            **kwargs
+        ):
+        super().__init__()
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(in_features=in_feats, out_features=h_feats),
+            nn.ELU(),
+            (nn.Dropout(mlp_dropout) if mlp_dropout > 0 else nn.Identity()),
+            nn.LayerNorm(h_feats),
+            nn.Linear(in_features=h_feats, out_features=h_feats)
+        )
+        in_feats = h_feats
+
+        self.hop_to_sample = 3  # 2 hop + 1 local
+        self.relations = 4  # maximum
+        self.groups = 3  # masked, benign, and fraud
+
+        assert num_edge_types <= self.relations, ("To match the transformer num_heads,"
+                                                  f" the num of relations should in the range of {self.relations}.")
+
+        self.hop_embeddings = GAGAEmbedding(self.hop_to_sample, in_feats)
+        self.rel_embeddings = GAGAEmbedding(self.relations, in_feats)
+        self.grp_embeddings = GAGAEmbedding(self.groups, in_feats)
+
+        self.transformer_layer = nn.TransformerEncoderLayer(
+            in_feats,
+            num_heads,
+            dropout=transformer_dropout,
+            dim_feedforward=128,
+        )
+        self.transformer = nn.TransformerEncoder(self.transformer_layer, n_layers)
+        
+        self.agg = agg
+        
+        in_feats = in_feats if agg == 'mean' else in_feats * num_edge_types
+        self.classifier = nn.Sequential(
+            nn.Linear(in_features=in_feats, out_features=num_classes),
+            nn.Softmax()
+        )
+
+    def pre_feature_sample(self, graph, label):
+        h = graph.ndata['feature']
+
+        def build_masked_feature(feature, label, target):
+            f = torch.clone(feature).detach()
+            f[(label != target).bool()] = torch.nan
+            return f
+
+        def deal_with_reducer_nan(feature, fill=0):
+            feature[feature.isnan()] = fill
+            return feature
+
+        def message_with_label_wrapper(cur_label, next_label, init=False, labels=None):
+            if labels is None:
+                labels = (0, 1, 2)
+
+            def messager_init(edges: dgl.udf.EdgeBatch):
+                label = edges.src['label']
+                feature = edges.src[cur_label]
+
+                return {
+                    f"{next_label}_{l}": build_masked_feature(feature, label, l) for l in labels
+                }
+
+            def messager(edges: dgl.udf.EdgeBatch):
+                return {
+                    f"{next_label}_{l}": edges.src[f"{cur_label}_{l}"] for l in labels
+                }
+
+            if init:
+                return messager_init
+            return messager
+
+        def pre_transformer_reducer_wrapper(cur_feat, next_feat, labels=None):
+            if labels is None:
+                labels = (0, 1, 2)
+
+            def reducer(nodes: dgl.udf.NodeBatch):
+                res = {
+                    f"{next_feat}_{l}": deal_with_reducer_nan(torch.nanmean(nodes.mailbox[f"{cur_feat}_{l}"], dim=1)) for l in labels
+                }
+                return res
+
+            return reducer
+
+        with graph.local_scope():
+            graph.ndata['feature'] = h
+            graph.ndata['label'] = label
+
+            labels = torch.unique(label).cpu().tolist()
+
+            edge_types = graph.etypes
+
+            # multi hop sampling
+            for e_id, etype in enumerate(edge_types):
+                graph.update_all(
+                    message_with_label_wrapper('feature', f'f_0_{e_id}', init=True, labels=labels),
+                    pre_transformer_reducer_wrapper(f'f_0_{e_id}', f'h_0_{e_id}', labels=labels),
+                    etype=etype
+                )
+                graph.update_all(
+                    message_with_label_wrapper(f'h_0_{e_id}', f'f_1_{e_id}', labels=labels),
+                    pre_transformer_reducer_wrapper(f'f_1_{e_id}', f'h_1_{e_id}', labels=labels),
+                    etype=etype
+                )
+
+            # feature extracting and position embedding inject
+            for eid, etype in enumerate(edge_types):
+                graph.ndata[f'final_feature_{eid}'] = torch.stack(
+                    [graph.ndata[f] for f in [
+                        'feature', *[f'h_0_{eid}_{l}' for l in labels], *[f'h_1_{eid}_{l}' for l in labels]
+                    ]],
+                    dim=1
+                )
+
+            res = []
+            for eid, etype in enumerate(edge_types):
+                res.append(
+                    graph.ndata[f'final_feature_{eid}']
+                )
+
+            sampled_feature = {k: v for k, v in zip(edge_types, res)}
+
+        return sampled_feature
+    
+    def forward(self, graph: dgl.DGLGraph, sampled_feature):
+        emb_type = {
+            "hop": self.hop_embeddings,
+            "rel": self.rel_embeddings,
+            "grp": self.grp_embeddings,
+        }
+        device = graph.device
+
+        def get_pos_emb(typ, pos, dtype=torch.float32, d=None) -> torch.Tensor:
+            d = d or device
+            return emb_type[typ](torch.tensor(pos).to(d)).to(d, dtype)
+
+        edge_types = graph.etypes
+
+        res = [sampled_feature[k] for k in edge_types]
+
+        res_sub = []
+        for r in res:
+            res_sub.append(self.mlp(r))
+        res = res_sub
+
+        res_sub = []
+        if len(edge_types) == 1:
+            target_shape = res[0].shape[0]
+            res_sub.append(
+                torch.sum(torch.stack(
+                (res[0],
+                    torch.sum(torch.stack([
+                        torch.stack((get_pos_emb("hop", 0), get_pos_emb("rel", 0), get_pos_emb("grp", 2))),
+                        *[torch.stack((get_pos_emb("hop", 1), get_pos_emb("rel", 0), get_pos_emb("grp", r_i))) for r_i in range(3)],
+                        *[torch.stack((get_pos_emb("hop", 2), get_pos_emb("rel", 0), get_pos_emb("grp", r_i))) for r_i in range(3)],
+                    ]), dim=1).broadcast_to((target_shape, -1, -1)))
+                , dim=2)
+            , dim=2))
+        else:
+            for e_i, _ in enumerate(edge_types):
+                target_shape = res[e_i].shape[0]
+                res_sub.append(
+                    torch.sum(torch.stack(
+                        (res[e_i],
+                        torch.sum(torch.stack([
+                            torch.stack((get_pos_emb("hop", 0), get_pos_emb("rel", e_i), get_pos_emb("grp", 2))),
+                            *[torch.stack((get_pos_emb("hop", 1), get_pos_emb("rel", e_i), get_pos_emb("grp", r_i))) for r_i in range(3)],
+                            *[torch.stack((get_pos_emb("hop", 2), get_pos_emb("rel", e_i), get_pos_emb("grp", r_i))) for r_i in range(3)],
+                        ]), dim=1).broadcast_to((target_shape, -1, -1)))
+                    , dim=2)
+                , dim=2))
+        res = res_sub
+
+        res_sub = []
+        for r in res:
+            res_sub.append(self.transformer(r).transpose(0, 1)[0])
+        res = res_sub
+
+        if self.agg == 'mean':
+            if len(edge_types) > 1:
+                res = [
+                    torch.mean(torch.stack(res, dim=0), dim=0)
+                ]
+        elif self.agg == 'cat':
+            res = [
+                torch.concat(res, dim=-1)
+            ]
+        else:
+            raise NotImplementedError(f"No such aggregation method: {self.agg}")
+
+        final = self.classifier(res[0])
+        return final
+
+
+# ConsisGAD
+class CustomLinear(nn.Linear):
+    def reset_parameters(self):
+        nn.init.xavier_normal_(self.weight)
+        nn.init.zeros_(self.bias)
+
+
+class CustomBatchNorm1d(nn.BatchNorm1d):
+    def forward(self, input, update_running_stats: bool=True):
+        self.track_running_stats = update_running_stats
+        return super(CustomBatchNorm1d, self).forward(input)
+
+
+class ConsisCombinedLoss(nn.Module):  # L + L_{c} => For consistenct training  # nll_loss
+    def __init__(self):
+        super(ConsisCombinedLoss, self).__init__()
+
+        self.cross_entropy_loss_labelled = nn.NLLLoss()
+        self.cross_entropy_loss_consist = nn.NLLLoss()
+    
+    def forward(self, p_v, y_v, y_w_u, p_h_u):
+        L_Cro = self.cross_entropy_loss_labelled(p_v, y_v)
+        L_Con = self.cross_entropy_loss_consist(p_h_u, y_w_u)
+        return L_Cro + L_Con
+
+
+class ConsisDataAugumentationLoss(nn.Module):  # alpha * L_{\delta c} + L_{\delta d}
+    def __init__(self):
+        super(ConsisDataAugumentationLoss, self).__init__()
+
+        # self.alpha = nn.Parameter(torch.randn((1), requires_grad=True))
+        self.alpha = 1.5
+
+        self.cross_entropy_loss_consist = nn.NLLLoss(reduction='none')
+    
+    def forward(self, h_u, h_h_u, y_w_u, p_h_u, i_mask):
+        L_Con = (self.cross_entropy_loss_consist(p_h_u, y_w_u) * i_mask).mean()
+        L_Div = (F.pairwise_distance(h_u, h_h_u) * i_mask).mean()
+        return self.alpha * L_Con + L_Div
+
+
+class ConsisGADCustomMLP(nn.Module):
+    def __init__(self, in_dim, out_dim, p, mid_dim, fin_act=True):
+        super(ConsisGADCustomMLP, self).__init__()
+
+        mod_list = [
+            CustomLinear(in_dim, mid_dim),
+            nn.ELU(),
+            nn.Dropout(p),
+            nn.LayerNorm(mid_dim),
+            CustomLinear(mid_dim, out_dim),
+        ] + (
+            [
+                nn.ELU(),
+                nn.Dropout(p)
+            ] if fin_act else []
+        )
+        self.mlp = nn.Sequential(*mod_list)
+    
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class ConsisGADGNNModule(nn.Module):
+    def __init__(self, in_feats, out_feats, edge_types: list, drop_rate: 0.8,
+                 mid_dim=64):
+        super(ConsisGADGNNModule, self).__init__()
+
+        self.edge_types = edge_types
+        
+        self.edge_mlp = nn.ModuleDict()
+        for edge_type in edge_types:
+            self.edge_mlp[edge_type] = ConsisGADCustomMLP(
+                in_feats * 2,  # in_feat + out_feat
+                out_feats, drop_rate, mid_dim
+            )
+        
+        self.before_ret = CustomLinear(out_feats, out_feats)
+        self.before_res = CustomLinear(in_feats, out_feats) if in_feats != out_feats else nn.Identity()
+        
+        self.edge_bn = nn.ModuleDict()
+        for edge_type in edge_types:
+            self.edge_bn[edge_type] = CustomBatchNorm1d(out_feats)
+    
+    def edge_func_wrap(self, edge_type):
+        mlp_func = self.edge_mlp[edge_type]
+
+        def func(edges):
+            x = torch.cat([edges.src['feat'], edges.dst['feat']], dim=-1)
+            x = mlp_func(x)
+            return {'proj': x}
+        return func
+    
+    def forward(self, g, features, update_bn=True):
+        with g.local_scope():
+            src_feat = dst_feat = features
+            if g.is_block:
+                dst_feat = src_feat[:g.num_dst_nodes()]  # keep limit features for sub-graph
+            
+            g.srcdata['feat'] = src_feat
+            g.dstdata['feat'] = dst_feat
+
+            for e_t in self.edge_types:
+                g.apply_edges(self.edge_func_wrap(e_t), etype=e_t)
+            for c_e_t in g.canonical_etypes:
+                if len(self.edge_types) == 1:
+                    g.edata['proj'] = self.edge_bn[self.edge_types[0]](g.edata['proj'], update_running_stats=update_bn)
+                else:
+                    g.edata['proj'][c_e_t] = self.edge_bn[c_e_t[1]](g.edata['proj'][c_e_t], update_running_stats=update_bn)
+            
+            etype_dict = {}
+            for e_t in self.edge_types:
+                etype_dict[e_t] = (fn.copy_e('proj', 'proj'), fn.sum('proj', 'out'))
+            g.multi_update_all(etype_dict=etype_dict, cross_reducer='stack')
+
+            out = g.dstdata.pop('out')
+            
+            out = torch.sum(out, dim=1)
+
+            return self.before_ret(out) + self.before_res(dst_feat)
+
+
+class ConsisGADGNN(nn.Module):
+    def __init__(self, in_feats, hid_feats, out_feats, edge_types, 
+                 input_mlp_mid_dim, mid_mlp_mid_dim,
+                 input_drop=0.0, hid_drop=0.0, mlp_drop=0.0,
+                 num_layers = 1):
+        super(ConsisGADGNN, self).__init__()
+
+        self.after_input = nn.Sequential(
+            nn.Dropout(input_drop),
+            ConsisGADCustomMLP(in_feats, hid_feats, mlp_drop, input_mlp_mid_dim),
+            CustomBatchNorm1d(hid_feats),
+        )
+        in_feats = hid_feats  # after proj
+
+        self.gnns = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for _ in range(num_layers):
+            self.gnns.append(
+                ConsisGADGNNModule(
+                    in_feats, hid_feats, edge_types, mlp_drop, mid_mlp_mid_dim
+                )
+            )
+            self.bns.append(
+                CustomBatchNorm1d(hid_feats)
+            )
+        
+        self.layer_dropout = nn.Dropout(hid_drop)
+        self.act = F.selu
+
+        self.before_ret = ConsisGADCustomMLP(
+            hid_feats * (num_layers + 1), out_feats, mlp_drop, input_mlp_mid_dim, fin_act=False
+        )
+    
+    def forward(self, blocks, update_bn=True, return_emb=False):
+        final_dim = blocks[-1].num_dst_nodes()
+        features = blocks[0].srcdata['feature']
+        features = self.after_input(features)
+
+        outputs = [features[:final_dim]]
+        x = features
+        for block, gnn, bn in zip(blocks, self.gnns, self.bns):
+            x = gnn(block, x, update_bn)
+            x = bn(x, update_running_stats=update_bn)
+            x = self.act(x)
+            x = self.layer_dropout(x)
+
+            outputs.append(x[:final_dim])
+        
+        if return_emb:
+            return outputs
+        else:
+            features = torch.stack(outputs, dim=1)
+            features = features.reshape((features.shape[0], -1))
+            features = self.before_ret(features)
+            features = features.log_softmax(dim=-1)
+            return features
+    
+    def predict(self, features):
+        features = self.before_ret(features)
+        features = features.log_softmax(dim=-1)
+        return features
+
+
+def l2_regularization(model):
+    l2_reg = torch.tensor(0., requires_grad=True)
+    for key, value in model.named_parameters():
+        if len(value.shape) > 1 and 'weight' in key:
+            l2_reg = l2_reg + torch.sum(value ** 2) * 0.5
+    return l2_reg
+
+
+class LearnableDataArugmentation(nn.Module):
+    def __init__(self, gnn, device="cuda", drop_rate=0.2, lr=0.01, eps=1e-15, temp=0.0001, weight_decay=1.0):
+        super(LearnableDataArugmentation, self).__init__()
+
+        self.xi = eps
+        self.temp = temp
+        self.drop_rate = drop_rate
+        self.weight_decay = weight_decay
+
+        self.pos_thr = 5
+        self.neg_thr = 85
+
+        self.gnn = gnn
+        self.mask_proj = CustomLinear(64, 64).to(device)
+
+        self.con_loss = ConsisDataAugumentationLoss().to(device)
+        self.optim = torch.optim.Adam(self.mask_proj.parameters(), lr=lr, weight_decay=0.0)
+    
+    def sharpen(self, h, chain=True):
+        h_hat = torch.zeros_like(h).to(h.device)
+        for _ in range(int(self.drop_rate * h.shape[0])):
+            if chain:  # do not detach grad from previous nums
+                m = 1 - h_hat  # reversed mask (1, 0)
+            else:  # do detach
+                m = torch.ones_like(h_hat)
+                m[h_hat == 1] = 0
+                m = m.to(h.device)
+            m_hat = torch.log(m + self.xi)  # get mask (0, -/inf)
+            y = torch.softmax(  # m_hat = 0 (h_hat = 0) and h => less ==> y = 1
+                (-h + m_hat) / self.temp, dim=0
+            )
+            h_hat += y * m
+        return 1 - h_hat
+    
+    def forward(self, u_blocks):
+        self.gnn.eval()
+
+        with torch.no_grad():
+            h_u = self.gnn(copy.deepcopy(u_blocks), update_bn=False, return_emb=True)
+            h_u = torch.stack(h_u, dim=1)
+            h_u = h_u.reshape((h_u.shape[0], -1))
+            p_w_u = self.gnn.predict(h_u).log_softmax(dim=-1).exp()[:, 1]
+        
+        y_w_u = torch.ones_like(p_w_u).long()
+        pos_mask = (p_w_u >= (self.pos_thr / 100)).bool()
+        neg_mask = (p_w_u <= (self.neg_thr / 100)).bool()
+        y_w_u[pos_mask] = 1
+        y_w_u[neg_mask] = 0
+        masked_index = torch.logical_or(pos_mask, neg_mask)
+
+        self.gnn.eval()
+        self.mask_proj.train()  # Linear
+        for param in self.gnn.parameters():
+            param.requires_grad = False
+        for param in self.mask_proj.parameters():
+            param.requires_grad = True
+
+        h_u_2 = self.gnn(copy.deepcopy(u_blocks), update_bn=False, return_emb=True)
+        to_stack = [h_u_2[0]]
+        for index in range(1, len(h_u_2)):
+            x = h_u_2[index]
+            x = self.mask_proj(x)
+            x = self.sharpen(x, chain=False)
+            to_stack.append(x)
+        
+        h_h_u = torch.stack(to_stack, dim=1)
+        h_h_u = h_h_u.reshape((h_h_u.shape[0], -1))
+        p_h_u = self.gnn.predict(h_h_u)
+        p_h_u = p_h_u.log_softmax(dim=-1)
+
+        loss = self.con_loss(h_u, h_h_u, y_w_u, p_h_u, masked_index) + self.weight_decay * l2_regularization(self.mask_proj)
+
+        self.optim.zero_grad()
+        loss.backward()
+        self.optim.step()
+
+        self.mask_proj.eval()
+        self.gnn.train()
+        for param in self.mask_proj.parameters():
+            param.requires_grad = False
+        for param in self.gnn.parameters():
+            param.requires_grad = True
+
+        # for gnn training
+
+        h_u_3 = self.gnn(copy.deepcopy(u_blocks), update_bn=False, return_emb=True)
+        to_stack = [h_u_3[0]]
+        for index in range(1, len(h_u_3)):
+            x = h_u_3[index]
+            x = self.mask_proj(x)
+            x = self.sharpen(x, chain=False)
+            to_stack.append(x)
+        
+        h_h_u_3 = torch.stack(to_stack, dim=1)
+        h_h_u_3 = h_h_u_3.reshape((h_h_u_3.shape[0], -1))
+        p_h_u_3 = self.gnn.predict(h_h_u_3)
+        p_h_u_3 = p_h_u_3.log_softmax(dim=-1)
+
+        return p_h_u_3, y_w_u  # preedicted pseudo label, pseudo label
+
+
+class DGAGNN(nn.Module):
+    def __init__(self, 
+                 in_feats: int,
+                 num_classes: int = 2,
+                 n_etypes: int = 1,
+                 # model parameters
+                 bin_encoding: bool = True,
+                 n_heads: int = 2,
+                 n_hidden: int = 128,
+                 p: float = 0.3,
+                 k: int = 4,
+                 z: float = 0.1,
+                 seed: int = 42,
+                 ):
+        super(DGAGNN, self).__init__()
+

@@ -12,6 +12,8 @@ import pandas as pd
 import itertools
 import psutil, os
 from catboost import Pool, CatBoostClassifier, CatBoostRegressor, sum_models
+from torch.utils.data import DataLoader
+from typing import Iterable
 
 
 class BaseDetector(object):
@@ -961,3 +963,313 @@ class H2FDetector(BaseDetector):
                 if self.patience_knt > self.train_config['patience']:
                     break
         return test_score
+
+
+def infinite_iter(data_list: Iterable):
+    it = iter(data_list)
+    while True:
+        try:
+            yield next(it)
+        except StopIteration:
+            it = iter(data_list)
+
+
+class GAGADetector(BaseDetector):
+    def __init__(self, train_config, model_config, data, cache=False, cache_dir="./gaga_%s.npz"):
+        super().__init__(train_config, model_config, data)
+        gnn = GAGA
+        model_config['in_feats'] = self.data.graph.ndata['feature'].shape[1]
+        model_config['num_edge_types'] = len(data.graph.etypes)
+        device = train_config['device']
+        self.model = gnn(**model_config).to(device)
+
+        dataset_name = data.name
+        etypes = data.graph.etypes
+        cache_name = cache_dir % (dataset_name.replace("/", "_"))
+
+        if not cache or not os.path.exists(cache_name):
+            self.masked_train_label = torch.clone(self.labels)  # label 0 = benign, 1 = fraud, 2 = masked
+            self.masked_train_label[~self.train_mask.bool()] = 2
+            while True:  # Loop until each type of label will be sampled
+                mask_rate = 0.95
+                random_mask = torch.rand(self.train_mask.sum()) < mask_rate
+                if (self.masked_train_label[self.train_mask][~random_mask] == 0).any() and \
+                    (self.masked_train_label[self.train_mask][~random_mask] == 1).any():
+                    break
+            self.masked_train_label[self.train_mask][random_mask] = 2
+
+            self.sampled_train_feature = self.model.pre_feature_sample(self.train_graph, self.masked_train_label)
+            self.sampled_val_feature = self.model.pre_feature_sample(self.val_graph, self.masked_train_label)
+            self.sampled_test_feature = self.model.pre_feature_sample(self.source_graph, self.masked_train_label)
+        else:  # cache == True and cache file exists
+            data = np.load(cache_name)
+            self.masked_train_label = torch.from_numpy(data['train_label']).to(device)
+
+            train_feature = torch.from_numpy(data['train_feature']).to(device)
+            val_feature = torch.from_numpy(data['val_feature']).to(device)
+            test_feature = torch.from_numpy(data['test_feature']).to(device)
+
+            self.sampled_train_feature = {etypes[i]: train_feature[i] for i in range(len(etypes))}
+            self.sampled_val_feature = {etypes[i]: val_feature[i] for i in range(len(etypes))}
+            self.sampled_test_feature = {etypes[i]: test_feature[i] for i in range(len(etypes))}
+
+            # if 'train_mask' in data and 'val_mask' in data and 'test_mask' in data:
+            #     self.train_mask = torch.from_numpy(data['train_mask'])
+            #     self.val_mask = torch.from_numpy(data['val_mask'])
+            #     self.test_mask = torch.from_numpy(data['test_mask'])
+
+        if cache and not os.path.exists(cache_name):
+            np.savez(cache_name,
+                     train_label=self.masked_train_label.detach().cpu().numpy(),
+                     train_feature=torch.stack([self.sampled_train_feature[k] for k in etypes], dim=0).detach().cpu().numpy(),
+                     val_feature=torch.stack([self.sampled_val_feature[k] for k in etypes], dim=0).detach().cpu().numpy(),
+                     test_feature=torch.stack([self.sampled_val_feature[k] for k in etypes], dim=0).detach().cpu().numpy()
+                     )
+
+        batch_size = model_config.get('batch_size', 256)
+        self.weight_decay = model_config.get('weight_decay', 1e-4)
+
+        data_length = list(self.sampled_train_feature.items())[0][1].shape[0]
+        self.train_loader = infinite_iter(DataLoader(torch.arange(data_length)[self.train_mask.cpu()], batch_size = batch_size, shuffle=True, drop_last=False, num_workers=8))
+        self.val_loader = infinite_iter(DataLoader(torch.arange(data_length)[self.val_mask.cpu()], batch_size = batch_size, shuffle=True, drop_last=False, num_workers=8))
+        self.test_loader = infinite_iter(DataLoader(torch.arange(data_length)[self.test_mask.cpu()], batch_size = batch_size, shuffle=True, drop_last=False, num_workers=8))
+
+    def get_data(self, type='train'):
+        assert type in ['train', 'val', 'test']
+        loader = {
+            'train': self.train_loader,
+            'val': self.val_loader,
+            'test': self.test_loader,
+        }[type]
+        features = {
+            'train': self.sampled_train_feature,
+            'val': self.sampled_val_feature,
+            'test': self.sampled_test_feature,
+        }[type]
+
+        data_idx = next(loader)
+        res = dict()
+        for k in features.keys():
+            res[k] = features[k][data_idx]
+        return res, data_idx
+
+    def train(self):
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.model_config['lr'], weight_decay=self.weight_decay)
+        train_labels, val_labels, test_labels = self.labels[self.train_mask], self.labels[self.val_mask], self.labels[self.test_mask]
+
+        for e in range(self.train_config['epochs']):
+            self.model.train()
+            data, idx = self.get_data('train')
+            logits = self.model(self.train_graph, data)
+            loss = F.cross_entropy(logits, self.masked_train_label[idx])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if self.model_config['drop_rate'] > 0 or self.train_config['inductive']:
+                self.model.eval()
+                data, idx = self.get_data('val')
+                logits = self.model(self.val_graph, data)
+            probs = logits.softmax(1)[:, 1]
+            try:
+                val_score = self.eval(self.labels[idx], probs)
+            except ValueError:
+                ...
+            if val_score[self.train_config['metric']] > self.best_score:
+                if self.train_config['inductive']:
+                    data, idx = self.get_data('test')
+                    logits = self.model(self.source_graph, data)
+                    probs = logits.softmax(1)[:, 1]
+                self.patience_knt = 0
+                self.best_score = val_score[self.train_config['metric']]
+                test_score = self.eval(self.labels[idx], probs)
+                print('Epoch {}, Loss {:.4f}, Val AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, test AUC {:.4f}, PRC {:.4f}, RecK {:.4f}'.format(
+                    e, loss, val_score['AUROC'], val_score['AUPRC'], val_score['RecK'],
+                    test_score['AUROC'], test_score['AUPRC'], test_score['RecK']))
+            else:
+                self.patience_knt += 1
+                if self.patience_knt > self.train_config['patience']:
+                    break
+        return test_score
+
+class ConsisGADDetector(BaseDetector):
+    def __init__(self, train_config, model_config, data):
+        super().__init__(train_config, model_config, data)
+        model_config['in_feats'] = self.data.graph.ndata['feature'].shape[1]
+
+        model_args = {
+            'to-homo': False,
+            'shuffle-train': True,
+            'hidden-dim': 64,
+            'num-layers': 1,
+            'weight-decay': 0.00001,
+            'training-ratio': 1,
+            'train-procedure': 'CT',
+            'mlp-drop': 0.4,
+            'input-drop': 0.0,
+            'hidden-drop': 0.0,
+            'mlp12-dim': 128,
+            'mlp3-dim': 128,
+            'bn-type': 2,
+            'optim': 'adam',
+            'store-model': True,
+            'trainable-consis-weight': 1.5,
+            'trainable-temp': 0.0001,
+            'trainable-eps': 0.000000000001,
+            'trainable-drop-rate': 0.2,
+            'trainable-warm-up': -1,
+            'trainable-model': 'mlp',
+            'trainable-optim': 'adam',
+            'trainable-lr': 0.005,
+            'trainable-weight-decay': 0.00001,
+            'topk-mode': 4,
+            'diversity-type': 'cos',
+            'unlabel-ratio': 4,
+            'normal-th': 7,
+            'fraud-th': 88,
+            'trainable-detach-y': True,
+            'trainable-div-eps': True,
+            'trainable-detach-mask': False,
+            'batch-size': 128,
+            'train-iterations': 10
+        }
+
+        model_args['device'] = 'cuda:0'
+        model_args.update(model_config)
+
+        print("[INFO]", "current model args =", model_args)
+
+        self.train_nids = torch.nonzero(self.data.graph.ndata['train_mask']).squeeze()
+        self.valid_nids = torch.nonzero(self.data.graph.ndata['val_mask']).squeeze()
+        self.test_nids = torch.nonzero(self.data.graph.ndata['test_mask']).squeeze()
+
+        self.labeled_nids = self.train_nids
+        self.unlabeled_nids = torch.concatenate([self.train_nids, self.valid_nids, self.test_nids])
+
+        power = 10 if data.name == 'tfinance' else 16
+        self.valid_loader = DataLoader(self.valid_nids, batch_size = 2 ** power, shuffle=False, drop_last=False, num_workers=4)
+        self.test_loader = DataLoader(self.test_nids, batch_size = 2 ** power, shuffle=False, drop_last=False, num_workers=4)
+        self.labeled_loader = DataLoader(self.labeled_nids, batch_size = model_args['batch-size'], shuffle=model_args['shuffle-train'], drop_last=True, num_workers=0)
+        self.unlabeled_loader = DataLoader(self.labeled_nids, batch_size = model_args['batch-size'] * model_args['unlabel-ratio'], shuffle=model_args['shuffle-train'], drop_last=True, num_workers=0)
+
+        self.model = ConsisGADGNN(
+            model_config['in_feats'],
+            64,
+            2,
+            self.source_graph.etypes,
+            128,
+            128,
+            model_args['input-drop'],
+            model_args['hidden-drop'],
+            model_args['mlp-drop'],
+            model_args['num-layers']
+        ).to(train_config['device'])
+
+        if model_args['optim'] == 'rmpprop':
+            self.optimizer = torch.optim.RMSprop(self.model.parameters(), lr=model_args['lr'])
+        else:
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=model_args['lr'], weight_decay=0.0)
+        self.sampler = dgl.dataloading.MultiLayerFullNeighborSampler(model_args['num-layers'])
+        self.argumentator = LearnableDataArugmentation(
+            self.model,
+            drop_rate=model_args['trainable-drop-rate'],
+            lr=model_args['trainable-lr'],
+            eps=model_args['trainable-eps'],
+            temp=model_args['trainable-temp'],
+            weight_decay=model_args['trainable-weight-decay'],
+        )
+
+        self.task_loss = ConsisCombinedLoss()
+
+        self.args = model_args
+    
+    @staticmethod
+    def sample_blocks(graph: dgl.DGLGraph, seed_nodes: torch.Tensor, sampler: dgl.dataloading.MultiLayerFullNeighborSampler):
+        seed_nodes = seed_nodes.to(graph.idtype)
+        input_nodes, output_nodes, blocks = sampler.sample_blocks(graph, seed_nodes)
+        return input_nodes, output_nodes, blocks
+
+    @staticmethod
+    def UDA_train_epoch(epoch, model, arugmentator, graph, loader, optimizer, sampler, task_loss, args):
+        model.train()
+        num_iters = args['train-iterations']
+        device = "cuda:0"
+        
+        label_loader, unlabel_loader = loader
+        unlabel_loader_iter = infinite_iter(unlabel_loader)
+        label_loader_iter = infinite_iter(label_loader)
+
+        for idx in range(num_iters):
+            label_idx = next(label_loader_iter)
+            unlabel_idx = next(unlabel_loader_iter)
+            assert label_idx is not None and unlabel_idx is not None
+
+            if epoch > args['trainable-warm-up']:
+                _, u, u_blocks = ConsisGADDetector.sample_blocks(graph, unlabel_idx.to(device), sampler)
+                p_h_u, y_w_u = arugmentator(u_blocks)
+            else:
+                p_h_u, y_w_u = torch.tensor(1.0, requires_grad=False), torch.tensor(1.0, requires_grad=False)
+
+            _, _, s_blocks = ConsisGADDetector.sample_blocks(graph, label_idx.to(device), sampler)
+            p_v = model(s_blocks)
+            y_v = s_blocks[-1].dstdata['label']
+
+            loss = task_loss(p_v, y_v, y_w_u, p_h_u) + args['weight-decay'] * l2_regularization(model)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        return p_v
+    
+    @staticmethod
+    def get_model_pred(model, graph, data_loader, sampler, args):
+        model.eval()
+
+        pred_list = []
+        target_list = []
+        with torch.no_grad():
+            for index, node_index in enumerate(data_loader):  # 1/4s pre 100 samples
+                _, _, blocks = sampler.sample_blocks(graph, node_index.to(args['device']).to(graph.idtype))
+                pred = model(blocks)
+                target = blocks[-1].dstdata['label']
+
+                pred.detach()
+                pred[pred.isnan()] = 0
+
+                pred_list.append(pred)
+                target_list.append(target.detach())
+
+            pred_list = torch.cat(pred_list, dim=0)
+            target_list = torch.cat(target_list, dim=0)
+            pred_list = pred_list.exp()[:, 1]
+        
+        return pred_list, target_list 
+
+    def train(self):
+        # train_labels, val_labels, test_labels = self.labels[self.train_mask], \
+        #                                         self.labels[self.val_mask], self.labels[self.test_mask]
+        for epoch in range(self.train_config['epochs']):
+            # print("[INFO]", f"current epoch={epoch}")
+            self.UDA_train_epoch(
+                epoch, self.model, self.argumentator, self.source_graph,
+                (self.labeled_loader, self.unlabeled_loader),
+                self.optimizer, self.sampler, self.task_loss, self.args
+            )
+            
+            val_probs, val_labels = self.get_model_pred(self.model, self.source_graph, self.valid_loader, self.sampler, self.args)
+            test_probs, test_labels = self.get_model_pred(self.model, self.source_graph, self.test_loader, self.sampler, self.args)
+
+            val_results, test_results = \
+                self.eval(val_labels, val_probs), self.eval(test_labels, test_probs)
+
+            # print("[DEBUG]", "current evaluate result =", val_results, test_results)
+            
+            if val_results[self.train_config['metric']] > self.best_score:
+                self.best_score = val_results[self.train_config['metric']]
+                test_in_best_val = test_results
+                print("[RES]", test_results, "@", epoch)
+
+                if self.args['store-model']:
+                    ...  # TODO
+
+        return test_in_best_val

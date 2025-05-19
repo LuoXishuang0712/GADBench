@@ -3,6 +3,7 @@ from models.detector import *
 from dgl.data.utils import load_graphs
 import os
 import json
+import pandas
 
 
 class Dataset:
@@ -59,6 +60,21 @@ model_detector_dict = {
     # Tree Ensembles with Neighbor Aggregation
     'RFGraph': RFGraphDetector,
     'XGBGraph': XGBGraphDetector,
+    
+    # Custom Methods
+    'MySAGE': BaseGNNDetector,
+    'GAGA': GAGADetector,
+    'ConsisGAD': ConsisGADDetector,
+    
+    # Extened SAGEs
+    'GraphSAGEMean': BaseGNNDetector,
+    'GraphSAGEPool': BaseGNNDetector,
+    'GraphSAGELSTM': BaseGNNDetector,
+    'GraphSAGEGCN': BaseGNNDetector,
+    'MySAGEMean': BaseGNNDetector,
+    'MySAGEPool': BaseGNNDetector,
+    'MySAGELSTM': BaseGNNDetector,
+    'MySAGEGCN': BaseGNNDetector,
 }
 
 
@@ -73,6 +89,98 @@ def save_results(results, file_id):
     print('save to file ID: {}'.format(file_id))
     return file_id
 
+def better_save_results(results, file_id):
+    if not os.path.exists('results/'):
+        os.mkdir('results/')
+    if file_id is None:
+        file_id = 0
+        while os.path.exists('results/{}.xlsx'.format(file_id)):
+            file_id += 1
+    
+    # Create Excel writer with multiple sheets
+    with pandas.ExcelWriter(f'results/{file_id}.xlsx', engine='openpyxl') as writer:
+        # Sheet 0 - All results (same as original function)
+        results.transpose().to_excel(writer, sheet_name='All Results')
+        
+        # Extract model names and dataset names
+        models = results['name'].tolist()
+        datasets = []
+        for col in results.columns:
+            if '-AUROC mean' in col:
+                datasets.append(col.split('-AUROC mean')[0])
+        
+        # Create separate sheets for each metric with datasets as rows and methods as columns
+        for metric in ['AUROC', 'AUPRC', 'RecK']:
+            metric_df = pandas.DataFrame(index=datasets, columns=models)
+            for dataset in datasets:
+                for i, model in enumerate(models):
+                    metric_df.loc[dataset, model] = results.iloc[i][f'{dataset}-{metric} mean']
+            metric_df.to_excel(writer, sheet_name=f'{metric} Mean')
+    
+    # Create markdown table
+    md_content = "# Results\n\n"
+    md_content += "| Dataset | Metric |"
+    for model in models:
+        md_content += f" {model} |"
+    md_content += "\n"
+    
+    # Header separator
+    md_content += "| --- | --- |"
+    for _ in models:
+        md_content += " --- |"
+    md_content += "\n"
+    
+    # Content rows
+    for dataset in datasets:
+        # First row for dataset has AUROC
+        md_content += f"| {dataset} | AUROC |"
+        for i, model in enumerate(models):
+            mean = results.iloc[i][f'{dataset}-AUROC mean']
+            std = results.iloc[i][f'{dataset}-AUROC std']
+            if not pandas.isna(mean) and not pandas.isna(std):
+                md_content += f" {mean:.4f} ±{std:.4f} |"
+            else:
+                md_content += " N/A |"
+        md_content += "\n"
+        
+        # Second row for AUPRC
+        md_content += f"| | AUPRC |"
+        for i, model in enumerate(models):
+            mean = results.iloc[i][f'{dataset}-AUPRC mean']
+            std = results.iloc[i][f'{dataset}-AUPRC std']
+            if not pandas.isna(mean) and not pandas.isna(std):
+                md_content += f" {mean:.4f} ±{std:.4f} |"
+            else:
+                md_content += " N/A |"
+        md_content += "\n"
+        
+        # Third row for RecK
+        md_content += f"| | RecK |"
+        for i, model in enumerate(models):
+            mean = results.iloc[i][f'{dataset}-RecK mean']
+            std = results.iloc[i][f'{dataset}-RecK std']
+            if not pandas.isna(mean) and not pandas.isna(std):
+                md_content += f" {mean:.4f} ±{std:.4f} |"
+            else:
+                md_content += " N/A |"
+        md_content += "\n"
+        
+        # # Fourth row for Time
+        # md_content += f"| | Time |"
+        # for i, model in enumerate(models):
+        #     time_val = results.loc[i, f'{dataset}-Time']
+        #     if not pandas.isna(time_val):
+        #         md_content += f" {time_val:.2f}s |"
+        #     else:
+        #         md_content += " N/A |"
+        # md_content += "\n"
+    
+    # Save markdown to file
+    with open(f'results/{file_id}.md', 'w') as f:
+        f.write(md_content)
+        
+    print(f'Results saved to file ID: {file_id} (Excel and Markdown)')
+    return file_id
 
 def sample_param(model, dataset, t=0):
     model_config = {'model': model, 'lr': 0.01, 'drop_rate': 0}
@@ -96,7 +204,31 @@ def sample_param(model, dataset, t=0):
     return model_config
 
 
+def sample_trial_param(trial, model, dataset, t=0):
+    model_config = {'model': model, 'lr': 0.01, 'drop_rate': 0}
+    if t == 0:
+        return model_config
+    for k, v in trial_space[model].items():
+        choice_method = v[0]
+        choice_args = v[1] if len(v) >= 2 else tuple()
+        choice_kwargs = v[2] if len(v) >= 3 else dict()
+        model_config[k] = eval(f"trial.suggest_{choice_method}(k, *choice_args, **choice_kwargs)")
+    # Avoid OOM in Random Search
+    if model in ['GAT', 'GATSep', 'GT'] and dataset in ['tfinance', 'dgraphfin', 'tsocial']:
+        model_config['h_feats'] = 16
+        model_config['num_heads'] = 2
+    if dataset == 'tsocial':
+        model_config['h_feats'] = 16
+    if dataset in ['dgraphfin', 'tsocial']:
+        # if 'k' in model_config:
+        #     model_config['k'] = min(5, model_config['k'])
+        if 'num_cluster' in model_config:
+            model_config['num_cluster'] = 2
+    return model_config
+
+
 param_space = {}
+trial_space = {}
 
 param_space['MLP'] = {
     'h_feats': [16, 32, 64],
@@ -138,6 +270,31 @@ param_space['GraphSAGE'] = {
     'drop_rate': [0, 0.1, 0.2, 0.3],
     'lr': 10 ** np.linspace(-3, -1, 1000),
     'activation': ['ReLU', 'LeakyReLU', 'Tanh']
+}
+trial_space['GraphSAGE'] = {
+    'h_feats': ('categorical', ([16, 32, 64], )),
+    'num_layers': ('int', (1, 3)),
+    'agg': ('categorical', (['mean', 'gcn', 'pool'], )),
+    'drop_rate': ('categorical', ([0, 0.1, 0.2, 0.3], )),
+    'lr': ("float", (10e-3, 10e-1)),
+    'activation': ('categorical', (['ReLU', 'LeakyReLU', 'Tanh'], ))
+}
+
+param_space['MySAGE'] = {
+    'h_feats': [16, 32, 64],
+    'num_layers': [1, 2, 3],
+    'agg': ['mean', 'gcn', 'pool'],
+    'dropout': [0, 0.1, 0.2, 0.3],
+    'lr': 10 ** np.linspace(-3, -1, 1000),
+    'activation': ['ReLU', 'LeakyReLU', 'Tanh']
+}
+trial_space['MySAGE'] = {
+    'h_feats': ('categorical', ([16, 32, 64], )),
+    'num_layers': ('int', (1, 3)),
+    'agg': ('categorical', (['mean', 'gcn', 'pool'], )),
+    'dropout': ('categorical', ([0, 0.1, 0.2, 0.3], )),
+    'lr': ("float", (10e-3, 10e-1)),
+    'activation': ('categorical', (['ReLU', 'LeakyReLU', 'Tanh'], ))
 }
 
 param_space['ChebNet'] = {
@@ -210,6 +367,12 @@ param_space['XGBoost'] = {
     'lambda': [0, 1, 10],
     'subsample': [0.5, 0.75, 1]
 }
+trial_space['XGBoost'] = {
+    'n_estimators': ("int", (10, 200)),
+    'eta': ("float", (0.05, 0.5)),
+    'lambda': ("categorical", ([0, 1, 10], )),
+    'subsample': ("categorical", ([0.5, 0.75, 1], ))
+}
 
 param_space['XGBGraph'] = {
     'n_estimators': list(range(10, 201)),
@@ -220,6 +383,16 @@ param_space['XGBGraph'] = {
     'num_layers': [1, 2, 3, 4],
     'agg': ['sum', 'max', 'mean'],
     'booster': ['gbtree', 'dart']
+}
+trial_space['XGBGraph'] = {
+    'n_estimators': ("int", (10, 200)),
+    'eta': ("float", (0.05, 0.5)),
+    'lambda': ("categorical", ([0, 1, 10], )),
+    # 'alpha': [0, 0.5, 1],
+    'subsample': ("categorical", ([0.5, 0.75, 1], )),
+    'num_layers': ("categorical", ([1, 2, 3, 4], )),
+    'agg': ("categorical", (['sum', 'max', 'mean'], )),
+    'booster': ("categorical", (['gbtree', 'dart'], ))
 }
 
 param_space['RF'] = {

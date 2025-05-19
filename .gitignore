@@ -1,5 +1,7 @@
 __pycache__/
 datasets/
-modes/__pycache__/
+**/__pycache__/
 catboost_info/
-results/
+results*/
+*.log
+optuna_db/

@@ -24,12 +24,18 @@ parser.add_argument('--semi_supervised', type=int, default=0)
 parser.add_argument('--inductive', type=int, default=0)
 parser.add_argument('--models', type=str, default=None)
 parser.add_argument('--datasets', type=str, default=None)
+parser.add_argument('--better_output', choices=['True', 'False'], default='True')
 args = parser.parse_args()
+
+better_result = args.better_output == 'True'
 
 columns = ['name']
 new_row = {}
 datasets = ['reddit', 'weibo', 'amazon', 'yelp', 'tfinance',
-            'elliptic', 'tolokers', 'questions', 'dgraphfin', 'tsocial', 'hetero/amazon', 'hetero/yelp']
+            'elliptic', 'tolokers', 'questions', 'dgraphfin', 'tsocial', 
+            # 'hetero/amazon', 'hetero/yelp'
+            'alpha_homora', 'cryptopia_hacker', 'plus_token_ponzi', 'upbit_hack'
+            ]
 models = model_detector_dict.keys()
 
 if args.datasets is not None:
@@ -38,7 +44,7 @@ if args.datasets is not None:
         datasets = datasets[int(st):int(ed)+1]
     else:
         datasets = [datasets[int(t)] for t in args.datasets.split(',')]
-    print('Evaluated Datasets: ', datasets)
+print('Evaluated Datasets: ', datasets)
 
 if args.models is not None:
     models = args.models.split('-')
@@ -79,23 +85,30 @@ for model in models:
             seed = seed_list[t]
             set_seed(seed)
             train_config['seed'] = seed
-            detector = model_detector_dict[model](train_config, model_config, data)
-            st = time.time()
-            print(detector.model)
-            test_score = detector.train()
+            try:
+                detector = model_detector_dict[model](train_config, model_config, data)
+                st = time.time()
+                print(detector.model)
+                test_score = detector.train()
+            except torch.cuda.OutOfMemoryError:
+                test_score = {'AUROC': 0, 'AUPRC': 0, 'RecK': 0}
+                print(f"Out of memory error for {model} on {dataset_name} at trial {t}.")
             auc_list.append(test_score['AUROC']), pre_list.append(test_score['AUPRC']), rec_list.append(test_score['RecK'])
             ed = time.time()
             time_cost += ed - st
         del detector, data
 
-        model_result[dataset_name+'-AUROC mean'] = np.mean(auc_list)
-        model_result[dataset_name+'-AUROC std'] = np.std(auc_list)
-        model_result[dataset_name+'-AUPRC mean'] = np.mean(pre_list)
-        model_result[dataset_name+'-AUPRC std'] = np.std(pre_list)
-        model_result[dataset_name+'-RecK mean'] = np.mean(rec_list)
-        model_result[dataset_name+'-RecK std'] = np.std(rec_list)
+        model_result[dataset_name+'-AUROC mean'] = np.mean(auc_list, where=np.array(auc_list) > 0)
+        model_result[dataset_name+'-AUROC std'] = np.std(auc_list, where=np.array(auc_list) > 0)
+        model_result[dataset_name+'-AUPRC mean'] = np.mean(pre_list, where=np.array(pre_list) > 0)
+        model_result[dataset_name+'-AUPRC std'] = np.std(pre_list, where=np.array(pre_list) > 0)
+        model_result[dataset_name+'-RecK mean'] = np.mean(rec_list, where=np.array(rec_list) > 0)
+        model_result[dataset_name+'-RecK std'] = np.std(rec_list, where=np.array(rec_list) > 0)
         model_result[dataset_name+'-Time'] = time_cost/args.trials
     model_result = pandas.DataFrame(model_result, index=[0])
     results = pandas.concat([results, model_result])
-    file_id = save_results(results, file_id)
+    if better_result:
+        file_id = better_save_results(results, file_id)
+    else:
+        file_id = save_results(results, file_id)
     print(results)
