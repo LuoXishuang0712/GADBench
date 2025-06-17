@@ -14,6 +14,7 @@ import psutil, os
 from catboost import Pool, CatBoostClassifier, CatBoostRegressor, sum_models
 from torch.utils.data import DataLoader
 from typing import Iterable
+import traceback
 
 
 class BaseDetector(object):
@@ -975,7 +976,7 @@ def infinite_iter(data_list: Iterable):
 
 
 class GAGADetector(BaseDetector):
-    def __init__(self, train_config, model_config, data, cache=False, cache_dir="./gaga_%s.npz"):
+    def __init__(self, train_config, model_config, data, cache=True, cache_dir="./gaga_%s.npz"):
         super().__init__(train_config, model_config, data)
         gnn = GAGA
         model_config['in_feats'] = self.data.graph.ndata['feature'].shape[1]
@@ -987,15 +988,19 @@ class GAGADetector(BaseDetector):
         etypes = data.graph.etypes
         cache_name = cache_dir % (dataset_name.replace("/", "_"))
 
-        if not cache or not os.path.exists(cache_name):
+        if not cache or not os.path.exists(cache_name):  # FIXME random mask may cause recall=0
             self.masked_train_label = torch.clone(self.labels)  # label 0 = benign, 1 = fraud, 2 = masked
             self.masked_train_label[~self.train_mask.bool()] = 2
             while True:  # Loop until each type of label will be sampled
-                mask_rate = 0.95
+                mask_rate = 0.8
                 random_mask = torch.rand(self.train_mask.sum()) < mask_rate
-                if (self.masked_train_label[self.train_mask][~random_mask] == 0).any() and \
-                    (self.masked_train_label[self.train_mask][~random_mask] == 1).any():
+                label_count = (torch.sum(self.masked_train_label[self.train_mask][~random_mask] == 0).item(), torch.sum(self.masked_train_label[self.train_mask][~random_mask] == 1).item())
+                label_balance = 1 - (abs(label_count[0] - label_count[1]) / (label_count[0] + label_count[1] + 1e-8))
+                dataset_count = (torch.sum(self.masked_train_label[self.train_mask] == 0).item(), torch.sum(self.masked_train_label[self.train_mask] == 1).item())
+                dataset_balance = 1 - (abs(dataset_count[0] - dataset_count[1]) / (dataset_count[0] + dataset_count[1] + 1e-8))
+                if label_count[0] != 0 and label_count[1] != 0 and label_balance > dataset_balance:  # Ensure both labels are present and balanced
                     break
+            print("Label balance: ", label_balance, "Dataset balance:", dataset_balance, "Label count: ", label_count)
             self.masked_train_label[self.train_mask][random_mask] = 2
 
             self.sampled_train_feature = self.model.pre_feature_sample(self.train_graph, self.masked_train_label)
@@ -1069,11 +1074,11 @@ class GAGADetector(BaseDetector):
                 self.model.eval()
                 data, idx = self.get_data('val')
                 logits = self.model(self.val_graph, data)
-            probs = logits.softmax(1)[:, 1]
+            probs = logits[:, 0]
             try:
                 val_score = self.eval(self.labels[idx], probs)
             except ValueError:
-                ...
+                print("ValueError: ", traceback.format_exc())
             if val_score[self.train_config['metric']] > self.best_score:
                 if self.train_config['inductive']:
                     data, idx = self.get_data('test')

@@ -1131,7 +1131,7 @@ class GAGA(nn.Module):  # Label Information Enhanced Fraud Detection against Low
         in_feats = in_feats if agg == 'mean' else in_feats * num_edge_types
         self.classifier = nn.Sequential(
             nn.Linear(in_features=in_feats, out_features=num_classes),
-            nn.Softmax()
+            nn.Softmax(0)
         )
 
     def pre_feature_sample(self, graph, label):
@@ -1581,6 +1581,114 @@ class LearnableDataArugmentation(nn.Module):
         p_h_u_3 = p_h_u_3.log_softmax(dim=-1)
 
         return p_h_u_3, y_w_u  # preedicted pseudo label, pseudo label
+
+
+class KYCConv(nn.Module):
+    def __init__(self, in_feats, out_feats, dropout, activation):
+        super(KYCConv, self).__init__()
+        self.in_feats = in_feats
+        self.out_feats = out_feats
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.activation = nn.ReLU() if activation == "ReLU" else nn.Tanh()
+        
+        self.neigh_linear = nn.Linear(in_feats, out_feats)
+        self.imp_linear = nn.Linear(in_feats, out_feats)
+        self.final_linear = nn.Linear(out_feats * 2, out_feats)
+    
+    def forward(self, graph):
+        with graph.local_scope():
+            h = graph.ndata["feature"]
+            graph.srcdata['h'] = h
+            graph.update_all(fn.copy_u('h', 'm'), fn.mean(msg='m', out='h'))
+            h = graph.dstdata['h']
+            g = graph.ndata['m_feature']
+            g = torch.mean(g, dim=1)
+            h = self.neigh_linear(h)
+            h = self.dropout(h)
+            h = self.activation(h)
+            g = self.imp_linear(g)
+            g = self.dropout(g)
+            g = self.activation(g)
+            h = torch.cat([h, g], dim=1)
+            h = self.final_linear(h)
+            h = self.dropout(h)
+            h = self.activation(h)
+        return h
+        
+
+# Who is Who on Ethereum? Account Labeling Using Heterophilic Graph Convolutional Network (2024 TSMC, Lin et al.)
+class KYCGCN(nn.Module):
+    def __init__(
+        self,
+        in_feats: int,
+        num_classes: int = 2,
+        h_feats: int = 32,
+        mlp_layers: int = 2,
+        n_layers: int = 3,
+        dropout: float = 0.5,
+        activation: str = "ReLU",
+        sample_size: int = 5,
+        teleport_const: float = 0.1,
+        residual_eps: float = 1e-8,
+        **kwargs
+    ):
+        super().__init__()
+        
+        self.sample_size = sample_size
+        self.teleport_const = teleport_const
+        self.residual_eps = residual_eps
+        
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.activation = nn.ReLU() if activation == "ReLU" else nn.Tanh()
+        self.mlp = MLP(h_feats, h_feats, num_classes, mlp_layers, dropout, activation)
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            in_feats = h_feats if i > 0 else in_feats
+            out_feats = h_feats
+            self.layers.append(KYCConv(in_feats, out_feats, dropout, activation))
+        
+    @staticmethod
+    def calc_appr(graph: dgl.DGLGraph):
+        A = graph.adjacency_matrix().to_dense()
+        X = graph.ndata["feature"]
+        
+        with torch.no_grad():
+            X_i = X.unsqueeze(0)
+            X_j = X.unsqueeze(1)
+            
+            dist = torch.norm(X_i - X_j, dim=-1, p=2)
+            # dist += 1e-8  # 1 has been added
+        
+        A_hat = A / (1 + dist)
+        
+        return A_hat
+        
+    def forward(self, graph: dgl.DGLGraph):
+        A_appr = self.calc_appr(graph)
+        A = graph.adjacency_matrix()
+        num_v = graph.number_of_nodes()
+        P = torch.zeros((num_v, num_v), device=graph.device, dtype=torch.float32)
+        R: torch.Tensor = torch.ones((num_v, num_v), device=graph.device, dtype=torch.float32)
+        
+        while True:
+            appr_thr = self.residual_eps * torch.sum(A_appr, dim=1)
+            if not (appr_thr > torch.sum(R, dim=1)).any():
+                break
+            P += R * self.teleport_const
+            R += (1 - self.teleport_const) * R.T * (A_appr / torch.sum(A_appr * A, dim=1))
+            _ = R.fill_diagonal_(0)  # ret as same as input tensor
+        
+        val, idx = torch.topk(P, k=self.sample_size)  # the most important neighbors for each node
+        with graph.local_scope():
+            for i, layer in enumerate(self.layers):
+                imp_multi_hop_neighbors = graph.ndata['feature'][idx]
+                graph.ndata['m_feature'] = imp_multi_hop_neighbors
+                if i > 0:
+                    graph.ndata['feature'] = self.dropout(graph.ndata['feature'])
+                graph.ndata['feature'] = layer(graph)
+            h = self.mlp(graph.ndata['feature'], False)
+        
+        return h
 
 
 class DGAGNN(nn.Module):

@@ -5,3 +5,4 @@ catboost_info/
 results*/
 *.log
 optuna_db/
+*.npz

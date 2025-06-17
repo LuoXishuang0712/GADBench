@@ -65,6 +65,7 @@ model_detector_dict = {
     'MySAGE': BaseGNNDetector,
     'GAGA': GAGADetector,
     'ConsisGAD': ConsisGADDetector,
+    'KYCGCN': BaseGNNDetector,
     
     # Extened SAGEs
     'GraphSAGEMean': BaseGNNDetector,
