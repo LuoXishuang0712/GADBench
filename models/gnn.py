@@ -13,6 +13,7 @@ import math
 import copy
 import numpy as np
 from typing import Literal
+from functools import lru_cache
 
 
 class PolyConv(nn.Module):
@@ -1662,8 +1663,11 @@ class KYCGCN(nn.Module):
         A_hat = A / (1 + dist)
         
         return A_hat
-        
-    def forward(self, graph: dgl.DGLGraph):
+    
+    @lru_cache
+    def get_sim_neighbor_cache4graph(self, graph: dgl.DGLGraph):
+        if graph.device != "cpu":
+            graph = graph.cpu()
         A_appr = self.calc_appr(graph)
         A = graph.adjacency_matrix()
         num_v = graph.number_of_nodes()
@@ -1679,6 +1683,11 @@ class KYCGCN(nn.Module):
             _ = R.fill_diagonal_(0)  # ret as same as input tensor
         
         val, idx = torch.topk(P, k=self.sample_size)  # the most important neighbors for each node
+        return val, idx
+        
+    def forward(self, graph: dgl.DGLGraph):
+        _, idx = self.get_sim_neighbor_cache4graph(graph)
+        
         with graph.local_scope():
             for i, layer in enumerate(self.layers):
                 imp_multi_hop_neighbors = graph.ndata['feature'][idx]
