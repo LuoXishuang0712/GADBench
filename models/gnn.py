@@ -1649,7 +1649,7 @@ class KYCGCN(nn.Module):
             self.layers.append(KYCConv(in_feats, out_feats, dropout, activation))
         
     @staticmethod
-    def calc_appr(graph: dgl.DGLGraph):
+    def calc_appr_full_matrix(graph: dgl.DGLGraph):
         A = graph.adjacency_matrix().to_dense()
         X = graph.ndata["feature"]
         
@@ -1664,6 +1664,28 @@ class KYCGCN(nn.Module):
         
         return A_hat
     
+    @staticmethod
+    def calc_appr_sparse_matrix(graph):
+        A = graph.adjacency_matrix()
+        X = graph.ndata['feature']
+
+        new_vals = []
+        with torch.no_grad():
+            for (i, j), v in zip(A.indices().T, A.val):
+                X_i = X[i]
+                X_j = X[j]
+                dist = torch.dist(X_i, X_j, p=2)
+                new_vals.append(v / (1 + dist))
+        
+        return torch.sparse_coo_tensor(A.indices(), new_vals, A.shape)
+
+    @classmethod
+    def calc_appr(cls, graph: dgl.DGLGraph):
+        if graph.adjacency_matrix().shape[0] > 10000:
+            return cls.calc_appr_sparse_matrix(graph)
+        else:
+            return cls.calc_appr_full_matrix(graph)
+    
     @lru_cache
     def get_sim_neighbor_cache4graph(self, graph: dgl.DGLGraph):
         if graph.device != "cpu":
@@ -1676,7 +1698,7 @@ class KYCGCN(nn.Module):
         
         while True:
             appr_thr = self.residual_eps * torch.sum(A_appr, dim=1)
-            if not (appr_thr > torch.sum(R, dim=1)).any():
+            if not (appr_thr.to_dense() > torch.sum(R, dim=1)).any():
                 break
             P += R * self.teleport_const
             R += (1 - self.teleport_const) * R.T * (A_appr / torch.sum(A_appr * A, dim=1))
@@ -1701,6 +1723,7 @@ class KYCGCN(nn.Module):
 
 
 class DGAGNN(nn.Module):
+
     def __init__(self, 
                  in_feats: int,
                  num_classes: int = 2,
