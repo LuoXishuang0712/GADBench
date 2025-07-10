@@ -14,6 +14,9 @@ import copy
 import numpy as np
 from typing import Literal
 from functools import lru_cache
+import torch_scatter
+import tqdm
+import numba as nb
 
 
 class PolyConv(nn.Module):
@@ -1623,12 +1626,12 @@ class KYCGCN(nn.Module):
         self,
         in_feats: int,
         num_classes: int = 2,
-        h_feats: int = 32,
+        h_feats: int = 128,
         mlp_layers: int = 2,
-        n_layers: int = 3,
-        dropout: float = 0.5,
-        activation: str = "ReLU",
-        sample_size: int = 5,
+        n_layers: int = 2,
+        dropout: float = 0.1,
+        activation: str = "LeakyReLU",
+        sample_size: int = 8,
         teleport_const: float = 0.1,
         residual_eps: float = 1e-8,
         **kwargs
@@ -1640,7 +1643,7 @@ class KYCGCN(nn.Module):
         self.residual_eps = residual_eps
         
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.activation = nn.ReLU() if activation == "ReLU" else nn.Tanh()
+        self.activation = getattr(nn, activation)
         self.mlp = MLP(h_feats, h_feats, num_classes, mlp_layers, dropout, activation)
         self.layers = nn.ModuleList()
         for i in range(n_layers):
@@ -1669,46 +1672,97 @@ class KYCGCN(nn.Module):
         A = graph.adjacency_matrix()
         X = graph.ndata['feature']
 
-        new_vals = []
         with torch.no_grad():
-            for (i, j), v in zip(A.indices().T, A.val):
-                X_i = X[i]
-                X_j = X[j]
-                dist = torch.dist(X_i, X_j, p=2)
-                new_vals.append(v / (1 + dist))
+            i_idx, j_idx = A.indices()
+            X_i = X[i_idx]
+            X_j = X[j_idx]
+            dist = torch.norm(X_i - X_j, p=2, dim=1)
+            new_vals = A.val / (1 + dist)
         
         return torch.sparse_coo_tensor(A.indices(), new_vals, A.shape)
 
     @classmethod
     def calc_appr(cls, graph: dgl.DGLGraph):
-        if graph.adjacency_matrix().shape[0] > 10000:
-            return cls.calc_appr_sparse_matrix(graph)
+        if True or graph.adjacency_matrix().shape[0] > 10000:  # Force sparse matrix
+            return cls.calc_appr_sparse_matrix(graph).coalesce()
         else:
             return cls.calc_appr_full_matrix(graph)
+        
+    @staticmethod
+    def csr_matrix_row_slice(tensor: torch.Tensor, start: int, end: int):
+        if tensor.layout != torch.sparse_csr:
+            return None
+        crow_indices = tensor.crow_indices()[start:end+1]
+        col_indices = tensor.col_indices()[crow_indices[0]:crow_indices[-1]]
+        values = tensor.values()[crow_indices[0]:crow_indices[-1]]
+        new_col_indices = torch.zeros_like(col_indices)
+        col_indices_map = []                # new_index: og_index
+        reverse_col_indices_map = dict()    # og_index: new_index
+        for i, v in enumerate(col_indices):
+            v = v.item()
+            ri = reverse_col_indices_map.get(v, None)
+            if ri is not None:
+                new_col_indices[i] = ri
+                continue
+            col_indices_map.append(v)
+            reverse_col_indices_map[v] = len(col_indices_map) - 1
+            new_col_indices[i] = reverse_col_indices_map[v]
+        return torch.sparse_csr_tensor(crow_indices - crow_indices[0], new_col_indices, values, size=(end-start, len(col_indices_map))), torch.tensor(col_indices_map)
     
+    @classmethod
+    def sparse_topk(cls, tensor: torch.Tensor, k: int, max_mem: float = 32, sparse_adj: float = 0.1):
+        if tensor.shape[0] < 100_000:
+            tensor = tensor.to_dense()
+        if tensor.layout != torch.sparse_csr:
+            tensor = tensor.to_sparse_csr()
+
+        max_t, min_t = torch.max(tensor.values()), torch.min(tensor.values())
+        v = (tensor.values() - min_t) / (max_t - min_t) * 255 # 2^8-1
+        tensor = torch.sparse_csr_tensor(tensor.crow_indices(), tensor.col_indices(), v, dtype=torch.int8)
+        
+        sparse_adj = max(0, min(sparse_adj, 1))
+        sparse_factor = (len(tensor.values()) / (tensor.shape[0] * tensor.shape[1]))
+        max_row = int(max(1, (max_mem * (1024 ** 3) / tensor.dtype.itemsize) // tensor.shape[1]) * (1 / (sparse_factor ** sparse_adj)))
+        vals, idxs = [], []
+        for start_i in range(0, tensor.shape[0], max_row):
+            end_i = min(start_i + max_row, tensor.shape[0])
+            # print(start_i, end_i)
+            batch_m, col_i_map = cls.csr_matrix_row_slice(tensor, start_i, end_i)
+            batch_m = batch_m.to_dense()
+            v, i = torch.topk(batch_m, k)
+            vals.append(v)
+            idxs.append(col_i_map[i])
+        return torch.cat(vals), torch.cat(idxs)
+
     @lru_cache
     def get_sim_neighbor_cache4graph(self, graph: dgl.DGLGraph):
         if graph.device != "cpu":
             graph = graph.cpu()
         A_appr = self.calc_appr(graph)
         A = graph.adjacency_matrix()
+        A = torch.sparse_coo_tensor(A.indices(), A.val, A.shape).coalesce()
         num_v = graph.number_of_nodes()
-        P = torch.zeros((num_v, num_v), device=graph.device, dtype=torch.float32)
-        R: torch.Tensor = torch.ones((num_v, num_v), device=graph.device, dtype=torch.float32)
+        P = torch.zeros_like(A.values(), device=graph.device, dtype=torch.float32)
+        R = torch.ones_like(A.values(), device=graph.device, dtype=torch.float32)
         
         while True:
-            appr_thr = self.residual_eps * torch.sum(A_appr, dim=1)
-            if not (appr_thr.to_dense() > torch.sum(R, dim=1)).any():
+            appr_thr = (self.residual_eps * torch.sum(A_appr, dim=1)).to_dense()
+            update_idx = (R >= appr_thr[A.indices()[0].to(torch.int64)])  # select \any s \in V
+            if not update_idx.any():
                 break
-            P += R * self.teleport_const
-            R += (1 - self.teleport_const) * R.T * (A_appr / torch.sum(A_appr * A, dim=1))
-            _ = R.fill_diagonal_(0)  # ret as same as input tensor
+            P[update_idx] += self.teleport_const * R[update_idx]
+            to_update_neigh_col = set(A.indices()[1][update_idx].unique().tolist())
+            # update_neigh_idx = (A.indices()[1][..., None] == to_update_neigh_col).any(dim=1)  # WARN may oom, create a A.shape[0] * len(to_update_neigh_col) matrix
+            update_neigh_idx = torch.tensor([c.item() in to_update_neigh_col for c in A.indices()[1]], dtype=torch.bool)  # Naive but safe
+            appr_sum = torch.sum(A_appr.values()[update_neigh_idx])
+            R[update_neigh_idx] = (1 - self.teleport_const) * R[A.indices()[0][update_neigh_idx]] * (A_appr.values()[update_neigh_idx] / appr_sum)
+            R[update_idx] = 0
         
-        val, idx = torch.topk(P, k=self.sample_size)  # the most important neighbors for each node
-        return val, idx
+        _, idx = self.sparse_topk(torch.sparse_coo_tensor(A.indices(), P, A.shape), k=self.sample_size)  # the most important neighbors for each node
+        return idx
         
     def forward(self, graph: dgl.DGLGraph):
-        _, idx = self.get_sim_neighbor_cache4graph(graph)
+        idx = self.get_sim_neighbor_cache4graph(graph)
         
         with graph.local_scope():
             for i, layer in enumerate(self.layers):
@@ -1720,6 +1774,11 @@ class KYCGCN(nn.Module):
             h = self.mlp(graph.ndata['feature'], False)
         
         return h
+
+
+# Global Attribute-Association Pattern Aggregation for Graph Fraud Detection (AAAI 25' Duan et al.)
+class GAAP(nn.Module):
+    ...
 
 
 class DGAGNN(nn.Module):

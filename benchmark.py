@@ -4,6 +4,7 @@ from utils import *
 import pandas
 import os
 import warnings
+import traceback
 warnings.filterwarnings("ignore")
 seed_list = list(range(3407, 10000, 10))
 
@@ -31,8 +32,8 @@ better_result = args.better_output == 'True'
 
 columns = ['name']
 new_row = {}
-datasets = ['reddit', 'weibo', 'amazon', 'yelp', 'tfinance',
-            'elliptic', 'tolokers', 'questions', 'dgraphfin', 'tsocial', 
+datasets = ['reddit', 'weibo', 'amazon', 'yelp', 'tolokers',
+            'questions', 'tfinance', 'elliptic', 'dgraphfin', 'tsocial', 
             # 'hetero/amazon', 'hetero/yelp'
             'alpha_homora', 'cryptopia_hacker', 'plus_token_ponzi', 'upbit_hack'
             ]
@@ -92,7 +93,7 @@ for model in models:
                 test_score = detector.train()
             except torch.cuda.OutOfMemoryError:
                 test_score = {'AUROC': 0, 'AUPRC': 0, 'RecK': 0}
-                print(f"Out of memory error for {model} on {dataset_name} at trial {t}.")
+                print(f"Out of memory error for {model} on {dataset_name} at trial {t}. OG traceback: \n{traceback.format_exc()}")
             auc_list.append(test_score['AUROC']), pre_list.append(test_score['AUPRC']), rec_list.append(test_score['RecK'])
             ed = time.time()
             time_cost += ed - st
