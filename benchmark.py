@@ -78,7 +78,7 @@ for model in models:
             # if model in ['GHRN', 'KNNGCN', 'AMNet', 'GT', 'GAT', 'GATv2', 'GATSep', 'PNA']:   # require more than 24G GPU memory
                 # continue
 
-        auc_list, pre_list, rec_list = [], [], []
+        auc_list, pre_list, rec_list, f1_list = [], [], [], []
         for t in range(args.trials):
             torch.cuda.empty_cache()
             print("Dataset {}, Model {}, Trial {}".format(dataset_name, model, t))
@@ -90,11 +90,11 @@ for model in models:
                 detector = model_detector_dict[model](train_config, model_config, data)
                 st = time.time()
                 print(detector.model)
-                test_score = detector.train()
+                test_score = detector.train()  # if no F1-score printed to stdout, check detector! the eval() in super class has been modified to return F1-score so in results.
             except torch.cuda.OutOfMemoryError:
-                test_score = {'AUROC': 0, 'AUPRC': 0, 'RecK': 0}
+                test_score = {'AUROC': 0, 'AUPRC': 0, 'RecK': 0, 'F1': 0}
                 print(f"Out of memory error for {model} on {dataset_name} at trial {t}. OG traceback: \n{traceback.format_exc()}")
-            auc_list.append(test_score['AUROC']), pre_list.append(test_score['AUPRC']), rec_list.append(test_score['RecK'])
+            auc_list.append(test_score['AUROC']), pre_list.append(test_score['AUPRC']), rec_list.append(test_score['RecK']), f1_list.append(test_score['F1'])
             ed = time.time()
             time_cost += ed - st
         del detector, data
@@ -105,6 +105,8 @@ for model in models:
         model_result[dataset_name+'-AUPRC std'] = np.std(pre_list, where=np.array(pre_list) > 0)
         model_result[dataset_name+'-RecK mean'] = np.mean(rec_list, where=np.array(rec_list) > 0)
         model_result[dataset_name+'-RecK std'] = np.std(rec_list, where=np.array(rec_list) > 0)
+        model_result[dataset_name+'-F1 mean'] = np.mean(f1_list, where=np.array(f1_list) > 0)
+        model_result[dataset_name+'-F1 std'] = np.std(f1_list, where=np.array(f1_list) > 0)
         model_result[dataset_name+'-Time'] = time_cost/args.trials
     model_result = pandas.DataFrame(model_result, index=[0])
     results = pandas.concat([results, model_result])

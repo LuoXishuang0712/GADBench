@@ -52,7 +52,7 @@ class BaseDetector(object):
                 probs = probs.cpu().numpy()
             score['AUROC'] = roc_auc_score(labels, probs)
             score['AUPRC'] = average_precision_score(labels, probs)
-            score['F1'] = f1_score(labels, probs)
+            score['F1'] = f1_score(labels, probs > 0.5)
             labels = np.array(labels)
             k = labels.sum()
         score['RecK'] = sum(labels[probs.argsort()[-k:]]) / sum(labels)
@@ -93,9 +93,9 @@ class BaseGNNDetector(BaseDetector):
                 self.patience_knt = 0
                 self.best_score = val_score[self.train_config['metric']]
                 test_score = self.eval(test_labels, probs[self.test_mask])
-                print('Epoch {}, Loss {:.4f}, Val AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, test AUC {:.4f}, PRC {:.4f}, RecK {:.4f}'.format(
-                    e, loss, val_score['AUROC'], val_score['AUPRC'], val_score['RecK'],
-                    test_score['AUROC'], test_score['AUPRC'], test_score['RecK']))
+                print('Epoch {}, Loss {:.4f}, Val AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, F1 {:.4f}, test AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, F1 {:.4f}'.format(
+                    e, loss, val_score['AUROC'], val_score['AUPRC'], val_score['RecK'], val_score['F1'],
+                    test_score['AUROC'], test_score['AUPRC'], test_score['RecK'], test_score['F1']))
             else:
                 self.patience_knt += 1
                 if self.patience_knt > self.train_config['patience']:
@@ -134,9 +134,9 @@ class HeteroGNNDetector(BaseDetector):
                 self.patience_knt = 0
                 self.best_score = val_score[self.train_config['metric']]
                 test_score = self.eval(test_labels, probs[self.test_mask])
-                print('Epoch {}, Loss {:.4f}, Val AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, test AUC {:.4f}, PRC {:.4f}, RecK {:.4f}'.format(
-                    e, loss, val_score['AUROC'], val_score['AUPRC'], val_score['RecK'],
-                    test_score['AUROC'], test_score['AUPRC'], test_score['RecK']))
+                print('Epoch {}, Loss {:.4f}, Val AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, F1 {:.4f}, test AUC {:.4f}, PRC {:.4f}, RecK {:.4f}, F1 {:.4f}'.format(
+                    e, loss, val_score['AUROC'], val_score['AUPRC'], val_score['RecK'], val_score['F1'],
+                    test_score['AUROC'], test_score['AUPRC'], test_score['RecK'], test_score['F1']))
             else:
                 self.patience_knt += 1
                 if self.patience_knt > self.train_config['patience']:

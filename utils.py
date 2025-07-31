@@ -111,7 +111,7 @@ def better_save_results(results, file_id):
                 datasets.append(col.split('-AUROC mean')[0])
         
         # Create separate sheets for each metric with datasets as rows and methods as columns
-        for metric in ['AUROC', 'AUPRC', 'RecK']:
+        for metric in ['AUROC', 'AUPRC', 'RecK', 'F1']:
             metric_df = pandas.DataFrame(index=datasets, columns=models)
             for dataset in datasets:
                 for i, model in enumerate(models):
@@ -160,6 +160,17 @@ def better_save_results(results, file_id):
         for i, model in enumerate(models):
             mean = results.iloc[i][f'{dataset}-RecK mean']
             std = results.iloc[i][f'{dataset}-RecK std']
+            if not pandas.isna(mean) and not pandas.isna(std):
+                md_content += f" {mean:.4f} ±{std:.4f} |"
+            else:
+                md_content += " N/A |"
+        md_content += "\n"
+
+        # Forth row for F1-score
+        md_content += f"| | F1-score |"
+        for i, model in enumerate(models):
+            mean = results.iloc[i][f'{dataset}-F1 mean']
+            std = results.iloc[i][f'{dataset}-F1 std']
             if not pandas.isna(mean) and not pandas.isna(std):
                 md_content += f" {mean:.4f} ±{std:.4f} |"
             else:
