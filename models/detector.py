@@ -3,7 +3,7 @@ from models.attention import *
 from sklearn import svm
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
 from sklearn.cluster import KMeans
 from dgl.nn.pytorch.factory import KNNGraph
 import dgl
@@ -52,6 +52,7 @@ class BaseDetector(object):
                 probs = probs.cpu().numpy()
             score['AUROC'] = roc_auc_score(labels, probs)
             score['AUPRC'] = average_precision_score(labels, probs)
+            score['F1'] = f1_score(labels, probs)
             labels = np.array(labels)
             k = labels.sum()
         score['RecK'] = sum(labels[probs.argsort()[-k:]]) / sum(labels)

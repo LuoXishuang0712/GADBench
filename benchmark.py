@@ -32,10 +32,10 @@ better_result = args.better_output == 'True'
 
 columns = ['name']
 new_row = {}
-datasets = ['reddit', 'weibo', 'amazon', 'yelp', 'tolokers',
-            'questions', 'tfinance', 'elliptic', 'dgraphfin', 'tsocial', 
+datasets = ['reddit', 'weibo', 'amazon', 'yelp', 'tolokers',                        # 0-4
+            'questions', 'tfinance', 'elliptic', 'dgraphfin', 'tsocial',            # 5-9
             # 'hetero/amazon', 'hetero/yelp'
-            'alpha_homora', 'cryptopia_hacker', 'plus_token_ponzi', 'upbit_hack'
+            'alpha_homora', 'cryptopia_hacker', 'plus_token_ponzi', 'upbit_hack',   # 10-13
             ]
 models = model_detector_dict.keys()
 

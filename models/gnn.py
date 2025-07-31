@@ -1711,7 +1711,7 @@ class KYCGCN(nn.Module):
     
     @classmethod
     def sparse_topk(cls, tensor: torch.Tensor, k: int, max_mem: float = 32, sparse_adj: float = 0.1):
-        if tensor.shape[0] < 100_000:
+        if False and tensor.shape[0] < 10_000:  # As the sparse process is quick enough, it is no need to use dense trick.
             tensor = tensor.to_dense()
         if tensor.layout != torch.sparse_csr:
             tensor = tensor.to_sparse_csr()

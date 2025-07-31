@@ -105,6 +105,10 @@ In the table below, we provide a summary of all datasets in GADBench, detailing 
 | 9  | [T-Social](https://github.com/squareRoot3/Rethinking-Anomaly-Detection)                                        | 5,781,065 | 73,105,508 |    10 |   3.0\% |  40\% | Social Friendship    | Misc. Information |
 | 10 | Amazon (Hetero)                                                                                             |    11,944 |  4,398,392 |    25 |   9.5\% |  70\% | Review Correlation   | Misc. Information |
 | 11 | YelpChi (Hetero)                                                                                            |    45,954 |  3,846,979 |    32 |  14.5\% |  70\% | Reviewer Interaction | Misc. Information |
+| 12 | alpha_homora                      | 76,813     | 664,285     | 16    | 8.69%         | 80.00% | Ethereum Transactions | Misc. Information |
+| 13 | cryptopia_hacker                  | 208,297    | 773,668     | 16    | 3.99%         | 80.00% | Ethereum Transactions | Misc. Information |
+| 14 | plus_token_ponzi                  | 34,712     | 91,264      | 16    | 88.68%        | 80.00% | Ethereum Transactions | Misc. Information |
+| 15 | upbit_hack                        | 451,725    | 1,683,563   | 16    | 3.75%         | 80.00% | Ethereum Transactions | Misc. Information |
 
 ### Citation
 
@@ -120,4 +124,3 @@ If you use this package and find it useful, please cite our paper using the foll
  volume = {36},
  year = {2023}
 }
-```
