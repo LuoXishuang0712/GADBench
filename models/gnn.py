@@ -16,7 +16,12 @@ from typing import Literal
 from functools import lru_cache
 import torch_scatter
 import tqdm
-import numba as nb
+# import numba as nb
+
+from models.dgagnn import DGAGNNWrapped as DGAGNN
+from models.secgfd import SECGFDWrapped as SECGFD
+from models.space_gnn import SpaceGNNWrapped as SpaceGNN
+from models.arc import ARCWrapped as ARC
 
 
 class PolyConv(nn.Module):
@@ -1779,22 +1784,4 @@ class KYCGCN(nn.Module):
 # Global Attribute-Association Pattern Aggregation for Graph Fraud Detection (AAAI 25' Duan et al.)
 class GAAP(nn.Module):
     ...
-
-
-class DGAGNN(nn.Module):
-
-    def __init__(self, 
-                 in_feats: int,
-                 num_classes: int = 2,
-                 n_etypes: int = 1,
-                 # model parameters
-                 bin_encoding: bool = True,
-                 n_heads: int = 2,
-                 n_hidden: int = 128,
-                 p: float = 0.3,
-                 k: int = 4,
-                 z: float = 0.1,
-                 seed: int = 42,
-                 ):
-        super(DGAGNN, self).__init__()
 

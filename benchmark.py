@@ -99,14 +99,9 @@ for model in models:
             time_cost += ed - st
         del detector, data
 
-        model_result[dataset_name+'-AUROC mean'] = np.mean(auc_list, where=np.array(auc_list) > 0)
-        model_result[dataset_name+'-AUROC std'] = np.std(auc_list, where=np.array(auc_list) > 0)
-        model_result[dataset_name+'-AUPRC mean'] = np.mean(pre_list, where=np.array(pre_list) > 0)
-        model_result[dataset_name+'-AUPRC std'] = np.std(pre_list, where=np.array(pre_list) > 0)
-        model_result[dataset_name+'-RecK mean'] = np.mean(rec_list, where=np.array(rec_list) > 0)
-        model_result[dataset_name+'-RecK std'] = np.std(rec_list, where=np.array(rec_list) > 0)
-        model_result[dataset_name+'-F1 mean'] = np.mean(f1_list, where=np.array(f1_list) > 0)
-        model_result[dataset_name+'-F1 std'] = np.std(f1_list, where=np.array(f1_list) > 0)
+        for metric in ['AUROC', 'AUPRC', 'RecK', 'F1', 'ACC']:
+            model_result[dataset_name+'-'+metric+' mean'] = np.mean(test_score[metric], where=np.array(test_score[metric]) > 0)
+            model_result[dataset_name+'-'+metric+' std'] = np.std(test_score[metric], where=np.array(test_score[metric]) > 0)
         model_result[dataset_name+'-Time'] = time_cost/args.trials
     model_result = pandas.DataFrame(model_result, index=[0])
     results = pandas.concat([results, model_result])

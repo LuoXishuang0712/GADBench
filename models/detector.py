@@ -3,7 +3,7 @@ from models.attention import *
 from sklearn import svm
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
+from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, accuracy_score
 from sklearn.cluster import KMeans
 from dgl.nn.pytorch.factory import KNNGraph
 import dgl
@@ -53,11 +53,20 @@ class BaseDetector(object):
             score['AUROC'] = roc_auc_score(labels, probs)
             score['AUPRC'] = average_precision_score(labels, probs)
             score['F1'] = f1_score(labels, probs > 0.5)
+            score['ACC'] = accuracy_score(labels, probs > 0.5)
             labels = np.array(labels)
             k = labels.sum()
         score['RecK'] = sum(labels[probs.argsort()[-k:]]) / sum(labels)
         return score
 
+    def plain_eval(self, data):
+        graph = data.graph.to(self.train_config['device'])
+        mask = graph.ndata['test_mask'].bool()
+        label = graph.ndata['label']
+        logits = self.model(graph)
+        probs = logits.softmax(1)[:, 1]
+        score = self.eval(label[mask], probs[mask])
+        return score
 
 class BaseGNNDetector(BaseDetector):
     def __init__(self, train_config, model_config, data):
@@ -1279,3 +1288,18 @@ class ConsisGADDetector(BaseDetector):
                     ...  # TODO
 
         return test_in_best_val
+    
+class DGAGNNDetector(BaseGNNDetector):
+    def __init__(self, train_config, model_config, data):
+        graph: dgl.DGLGraph = data.graph
+        num_nodes = graph.num_nodes()
+        num_etypes = len(graph.etypes)
+        model_config['n_nodes'] = num_nodes
+        model_config['n_etypes'] = num_etypes
+        super().__init__(train_config, model_config, data)
+
+class SECGFDDetector(BaseGNNDetector):
+    def __init__(self, train_config, model_config, data):
+        graph: dgl.DGLGraph = data.graph
+        model_config['graph'] = graph.to(train_config['device'])
+        super().__init__(train_config, model_config, data)

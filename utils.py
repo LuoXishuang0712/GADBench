@@ -3,6 +3,7 @@ from models.detector import *
 from dgl.data.utils import load_graphs
 import os
 import json
+import torch
 import pandas
 
 
@@ -10,6 +11,12 @@ class Dataset:
     def __init__(self, name='tfinance', prefix='datasets/'):
         graph = load_graphs(prefix + name)[0][0]
         self.name = name
+
+        if graph.ndata['label'].dtype != torch.int64:
+            graph.ndata['label'] = graph.ndata['label'].to(torch.int64)
+        # if graph.ndata['feature'].dtype != torch.float64:
+        #     graph.ndata['feature'] = graph.ndata['feature'].to(torch.float64)
+
         self.graph = graph
 
     def split(self, semi_supervised=True, trial_id=0):
@@ -66,6 +73,10 @@ model_detector_dict = {
     'GAGA': GAGADetector,
     'ConsisGAD': ConsisGADDetector,
     'KYCGCN': BaseGNNDetector,
+    'SpaceGNN': BaseGNNDetector,
+    'DGAGNN': DGAGNNDetector,
+    'SECGFD': SECGFDDetector,
+    'ARC': BaseGNNDetector,
     
     # Extened SAGEs
     'GraphSAGEMean': BaseGNNDetector,
@@ -111,7 +122,7 @@ def better_save_results(results, file_id):
                 datasets.append(col.split('-AUROC mean')[0])
         
         # Create separate sheets for each metric with datasets as rows and methods as columns
-        for metric in ['AUROC', 'AUPRC', 'RecK', 'F1']:
+        for metric in ['AUROC', 'AUPRC', 'RecK', 'F1', 'ACC']:
             metric_df = pandas.DataFrame(index=datasets, columns=models)
             for dataset in datasets:
                 for i, model in enumerate(models):
@@ -133,59 +144,36 @@ def better_save_results(results, file_id):
     
     # Content rows
     for dataset in datasets:
-        # First row for dataset has AUROC
-        md_content += f"| {dataset} | AUROC |"
-        for i, model in enumerate(models):
-            mean = results.iloc[i][f'{dataset}-AUROC mean']
-            std = results.iloc[i][f'{dataset}-AUROC std']
-            if not pandas.isna(mean) and not pandas.isna(std):
-                md_content += f" {mean:.4f} ±{std:.4f} |"
-            else:
-                md_content += " N/A |"
-        md_content += "\n"
+        metrics = [
+            ("AUROC", "AUROC"),
+            ("AUPRC", "AUPRC"),
+            ("RecK", "RecK"),
+            ("F1", "F1-score"), 
+            ("ACC", "ACC"), 
+        ]
         
-        # Second row for AUPRC
-        md_content += f"| | AUPRC |"
-        for i, model in enumerate(models):
-            mean = results.iloc[i][f'{dataset}-AUPRC mean']
-            std = results.iloc[i][f'{dataset}-AUPRC std']
-            if not pandas.isna(mean) and not pandas.isna(std):
-                md_content += f" {mean:.4f} ±{std:.4f} |"
+        for idx, (metric_key, metric_display) in enumerate(metrics):
+            # First column: dataset only on first row
+            if idx == 0:
+                md_content += f"| {dataset} | {metric_display} |"
             else:
-                md_content += " N/A |"
-        md_content += "\n"
+                md_content += f"| | {metric_display} |"
         
-        # Third row for RecK
-        md_content += f"| | RecK |"
-        for i, model in enumerate(models):
-            mean = results.iloc[i][f'{dataset}-RecK mean']
-            std = results.iloc[i][f'{dataset}-RecK std']
-            if not pandas.isna(mean) and not pandas.isna(std):
-                md_content += f" {mean:.4f} ±{std:.4f} |"
-            else:
-                md_content += " N/A |"
-        md_content += "\n"
-
-        # Forth row for F1-score
-        md_content += f"| | F1-score |"
-        for i, model in enumerate(models):
-            mean = results.iloc[i][f'{dataset}-F1 mean']
-            std = results.iloc[i][f'{dataset}-F1 std']
-            if not pandas.isna(mean) and not pandas.isna(std):
-                md_content += f" {mean:.4f} ±{std:.4f} |"
-            else:
-                md_content += " N/A |"
-        md_content += "\n"
+            for i, model in enumerate(models):
+                mean_col = f'{dataset}-{metric_key} mean'
+                std_col = f'{dataset}-{metric_key} std'
         
-        # # Fourth row for Time
-        # md_content += f"| | Time |"
-        # for i, model in enumerate(models):
-        #     time_val = results.loc[i, f'{dataset}-Time']
-        #     if not pandas.isna(time_val):
-        #         md_content += f" {time_val:.2f}s |"
-        #     else:
-        #         md_content += " N/A |"
-        # md_content += "\n"
+                try:
+                    mean = results.iloc[i][mean_col]
+                    std = results.iloc[i][std_col]
+                    if not pandas.isna(mean) and not pandas.isna(std):
+                        md_content += f" {mean:.4f} ±{std:.4f} |"
+                    else:
+                        md_content += " N/A |"
+                except (KeyError, IndexError):
+                    md_content += " N/A |"
+        
+            md_content += "\n"
     
     # Save markdown to file
     with open(f'results/{file_id}.md', 'w') as f:
